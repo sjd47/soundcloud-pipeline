@@ -69,10 +69,9 @@ def tg_send_document(file_path: str, caption: str = ""):
 
 # ----------------- Google Drive -----------------
 def build_drive():
-    creds = Credentials.from_authorized_user_file(
-        GDRIVE_TOKEN_JSON_PATH,
-        scopes=["https://www.googleapis.com/auth/drive"]
-    )
+    # از همان scopeهای ذخیره‌شده در token.json استفاده می‌کنیم (بدون override)
+    creds = Credentials.from_authorized_user_file(GDRIVE_TOKEN_JSON_PATH)
+    print("Drive token scopes:", getattr(creds, "scopes", None))
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 def download_sheet_as_csv(service, file_id: str) -> pd.DataFrame:
