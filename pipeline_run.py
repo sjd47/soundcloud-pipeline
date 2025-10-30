@@ -199,10 +199,14 @@ def load_artists_any() -> pd.DataFrame:
 
             return df
 
-    # 3) Built-in single fallback
-    print("  ⚠️ no artist source found → using fallback 1 artist")
-    return pd.DataFrame({"artist_urn": ["soundcloud:users:380097545"]})
 
+   # 3) No source found → stop (fail fast in CI)
+raise RuntimeError(
+    "No artist source found. Set GSHEET_ARTISTS_FILE_ID (Google Sheet) "
+    "or ARTISTS_DRIVE_FILE_ID (Drive file), or add data/artists.xlsx in repo."
+)
+
+  
 
 # ----------------- SoundCloud -----------------
 def sc_get_access_token():
