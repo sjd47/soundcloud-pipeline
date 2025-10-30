@@ -201,6 +201,70 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+
+
+# ---------------- Python basics ----------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.eggs/
+*.egg-info/
+dist/
+build/
+
+# ---------------- Virtualenvs ----------------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------------- IDE/OS noise ----------------
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+
+# ---------------- Logs & notebooks ----------------
+logs/
+*.log
+.ipynb_checkpoints/
+
+# ---------------- Project secrets (VERY IMPORTANT) ----------------
+# فایل‌های لاگین و کلیدها، حتماً نباید پابلیک شوند
+.env
+.env.*
+!*.example
+
+OAuth Client (Desktop)/
+google drive API/
+*client_secret*.json
+*credentials*.json
+*service_account*.json
+*token*.json
+
+# ---------------- Local data ----------------
+# فایل واقعی آرتیست‌ها و هر دیتای محلی
+data/
+artists_resolved.xlsx
+artists*.xlsx
+
+# اگر می‌خوای یک تمپلیت نمونه پابلیک باشه، استثناء بگذار:
+!example_artists_template.xlsx
+
+# ---------------- Outputs ----------------
+# خروجی‌های روزانه/تستی
+outputs/
+*.xlsx
+soundcloud_batch_*.xlsx
+soundcloud_single_*.xlsx
+
+# ---------------- Caches ----------------
+.cache/
+
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
