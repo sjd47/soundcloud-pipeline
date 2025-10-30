@@ -319,6 +319,11 @@ def main():
     print("در حال خواندن لیست آرتیست‌ها ...")
     artists_df = load_artists_any()
     artists = artists_df["artist_urn"].tolist()
+
+    
+    print("🔎 loaded rows from Drive:", len(artists_df))
+    print(artists_df.head(3).to_string(index=False))
+
     n = len(artists)
     print(f"تعداد آرتیست‌ها: {n}\n")
 
