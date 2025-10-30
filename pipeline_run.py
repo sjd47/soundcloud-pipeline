@@ -132,8 +132,10 @@ def _find_col(df, candidates, required=True):
 def load_artists_df_from_drive() -> pd.DataFrame:
     service = build_drive()
     if GSHEET_ARTISTS_FILE_ID:
+        print(f"  using source: GSHEET (file_id={GSHEET_ARTISTS_FILE_ID})")  # ← خط جدید
         df = download_sheet_as_csv(service, GSHEET_ARTISTS_FILE_ID)
     elif ARTISTS_DRIVE_FILE_ID:
+        print(f"  using source: DRIVE FILE (file_id={ARTISTS_DRIVE_FILE_ID})")  # ← خط جدید
         data = download_drive_file(service, ARTISTS_DRIVE_FILE_ID)
         try:
             df = pd.read_excel(io.BytesIO(data))
@@ -161,52 +163,20 @@ def load_artists_df_from_drive() -> pd.DataFrame:
     return df
 
 
+
 def load_artists_any() -> pd.DataFrame:
     """
-    اول تلاش می‌کند از Google Sheet/Drive بخواند.
-    اگر شکست خورد → از لوکال (data/artists.xlsx یا data/artists.csv).
-    اگر باز هم نبود → یک آرتیست تستی برمی‌گرداند تا CI fail نشود.
+    فقط از Google Sheet/Drive می‌خواند. اگر در دسترس نبود → خطا می‌دهد (CI fail-fast).
     """
-    # 1) Google Sheet/Drive
     try:
         return load_artists_df_from_drive()
     except Exception as e:
-        print("  ⚠️ Google Drive/Sheet load failed →", e)
+        raise RuntimeError(
+            f"artists load failed from Drive/Sheet: {e}\n"
+            "Set GSHEET_ARTISTS_FILE_ID (Google Sheet) یا ARTISTS_DRIVE_FILE_ID (Drive file) "
+            "و مطمئن شو token.json درست نوشته شده."
+        )
 
-    # 2) Local fallback
-    for p in ("data/artists.xlsx", "data/artists.csv"):
-        if os.path.exists(p):
-            print(f"  ✅ local fallback: {p}")
-            df = pd.read_excel(p) if p.endswith(".xlsx") else pd.read_csv(p)
-
-            # نرمال‌سازی ستون‌ها مثل همان منطق بالا
-            col_urn = _find_col(df, URN_CANDIDATES, required=True)
-            col_input_name = _find_col(df, INPUT_NAME_CANDIDATES, required=False)
-            col_sc_name    = _find_col(df, SC_NAME_CANDIDATES,    required=False)
-
-            df[col_urn] = df[col_urn].astype(str).str.strip()
-            mask_num = df[col_urn].str.fullmatch(r"\d+")
-            df.loc[mask_num, col_urn] = df.loc[mask_num, col_urn].map(lambda x: f"soundcloud:users:{x}")
-            df = df.dropna(subset=[col_urn])
-            df = df[df[col_urn] != ""].drop_duplicates(subset=[col_urn]).reset_index(drop=True)
-
-            if col_input_name and "artist_input_name" not in df.columns:
-                df.rename(columns={col_input_name: "artist_input_name"}, inplace=True)
-            if col_sc_name and "artist_name" not in df.columns:
-                df.rename(columns={col_sc_name: "artist_name"}, inplace=True)
-            if col_urn != "artist_urn":
-                df.rename(columns={col_urn: "artist_urn"}, inplace=True)
-
-            return df
-
-
-   # 3) No source found → stop (fail fast in CI)
-raise RuntimeError(
-    "No artist source found. Set GSHEET_ARTISTS_FILE_ID (Google Sheet) "
-    "or ARTISTS_DRIVE_FILE_ID (Drive file), or add data/artists.xlsx in repo."
-)
-
-  
 
 # ----------------- SoundCloud -----------------
 def sc_get_access_token():
