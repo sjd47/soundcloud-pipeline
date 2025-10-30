@@ -25,20 +25,22 @@ jobs:
           pip install -r requirements.txt
 
       # توکن OAuth درایو را از Secret به فایل token.json می‌نویسیم و صحت JSON را چک می‌کنیم
+      # توکن OAuth درایو را از Secret به فایل token.json می‌نویسیم و صحت JSON را چک می‌کنیم
       - name: Write Drive OAuth token.json
         run: |
           echo '${{ secrets.GDRIVE_TOKEN_JSON }}' > token.json
           python - <<'PY'
-          import json, sys
-          p = "token.json"
+          import json, sys, pathlib
+          p = pathlib.Path("token.json")
           try:
-              with open(p, "r", encoding="utf-8") as f:
-                  js = json.load(f)
-              print("token.json OK, keys:", ", ".join(js.keys()))
+              js = json.loads(p.read_text(encoding="utf-8"))
           except Exception as e:
               print("token.json invalid:", e)
               sys.exit(1)
+          print("token.json OK, keys:", ", ".join(js.keys()))
+          print("scopes in token.json:", js.get("scopes"))
           PY
+
 
       - name: Run pipeline
         env:
