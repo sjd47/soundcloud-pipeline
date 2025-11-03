@@ -616,10 +616,83 @@ def main():
                 })
 
     # ===== 5) ساخت DataFrameها =====
+        # ===== 5) ساخت DataFrameها =====
     df_tracks  = pd.DataFrame(track_rows)
     df_albums  = pd.DataFrame(album_rows)
     df_artists = pd.DataFrame(artist_rows)
     df_errors  = pd.DataFrame(error_rows)
+
+    # شیت مشکلات ترک‌ها را فعلاً خالی می‌سازیم
+    df_tracks_issues = pd.DataFrame()
+
+    # ===== 5.1) retry گلوبال برای ترک‌هایی که متریک ناقص دارند =====
+    if not df_tracks.empty:
+        metric_cols = ["playback_count", "likes_count", "comment_count", "reposts_count"]
+        # ردیف‌هایی که حداقل یکی از این متریک‌ها None است
+        mask_missing = df_tracks[metric_cols].isna().any(axis=1)
+        problematic_urns = (
+            df_tracks.loc[mask_missing, "track_urn"]
+            .dropna()
+            .drop_duplicates()
+            .tolist()
+        )
+
+        if problematic_urns:
+            print(f"\n=== ✳️ شروع retry گلوبال برای {len(problematic_urns)} ترک با متریک ناقص ===")
+            remaining_urns = problematic_urns
+
+            for round_idx in range(1, 3):  # مثلاً دو دور گلوبال
+                if not remaining_urns:
+                    break
+
+                print(f"    [global metrics retry round {round_idx}] {len(remaining_urns)} ترک ...")
+                refreshed = sc_hydrate_tracks(sess, remaining_urns)
+                refreshed_by_urn = {t.get("urn"): t for t in refreshed if t.get("urn")}
+
+                still_bad = []
+                for u in remaining_urns:
+                    t = refreshed_by_urn.get(u)
+                    # اگر هنوز متریک ناقص است یا اصلاً برنگشته → بذار برای دور بعد
+                    if not t or track_metrics_any_missing(t):
+                        still_bad.append(u)
+                        continue
+
+                    # متریک‌ها کامل شد → ردیف/ردیف‌های این ترک را آپدیت می‌کنیم
+                    mask_u = df_tracks["track_urn"] == u
+                    df_tracks.loc[mask_u, "playback_count"] = t.get("playback_count")
+                    df_tracks.loc[mask_u, "likes_count"]    = t.get("favoritings_count")
+                    df_tracks.loc[mask_u, "comment_count"]  = t.get("comment_count")
+                    df_tracks.loc[mask_u, "reposts_count"]  = t.get("reposts_count")
+
+                remaining_urns = still_bad
+
+            if remaining_urns:
+                print(f"    ⚠️ بعد از retry گلوبال هنوز {len(remaining_urns)} ترک متریک ناقص دارند.")
+
+            # بعد از retry گلوبال، یک‌بار دیگر ماسک نهایی ردیف‌های مشکل‌دار را می‌سازیم
+            mask_missing_final = df_tracks[metric_cols].isna().any(axis=1)
+            if mask_missing_final.any():
+                ts_issues = iran_now().strftime("%Y-%m-%d %H:%M:%S")
+                issues_rows = []
+                for _, r in df_tracks.loc[mask_missing_final].iterrows():
+                    issues_rows.append({
+                        "timestamp": ts_issues,
+                        "artist_urn": r.get("artist_urn"),
+                        "track_urn": r.get("track_urn"),
+                        "issue_type": "metrics_incomplete_after_global_retry",
+                    })
+                df_tracks_issues = pd.DataFrame(issues_rows)
+
+            # و در نهایت تعداد ترک‌های با متریک ناقص را از همین ماسک نهایی حساب می‌کنیم
+            metrics_missing_total = int(mask_missing_final.sum())
+        else:
+            # یعنی هیچ ردیفی با متریک ناقص نداریم
+            metrics_missing_total = 0
+    else:
+        metrics_missing_total = 0
+
+    # تعداد ترک‌ها را بر اساس خروجی نهایی df_tracks تنظیم می‌کنیم
+    tracks_total = int(len(df_tracks))
 
     elapsed = time.time() - start
     snapshot_date = iran_now().strftime("%Y-%m-%d")
@@ -636,9 +709,10 @@ def main():
         "artists_in": n,
         "artists_ok": ok_count,
         "artists_failed": fail_count,
-        "tracks_total": int(tracks_total),
+        "tracks_total": int(tracks_total),              # الان از df_tracks می‌آد
         "albums_total": int(albums_total),
         "errors_total": errors_total,
+        "tracks_metrics_missing_total": int(metrics_missing_total),
     }])
 
     # ===== 6) ذخیره اکسل =====
@@ -651,6 +725,8 @@ def main():
         meta.to_excel(w, index=False, sheet_name="meta")
         if len(df_errors):
             df_errors.to_excel(w, index=False, sheet_name="errors")
+        if not df_tracks_issues.empty:
+            df_tracks_issues.to_excel(w, index=False, sheet_name="tracks_issues")
 
     print("\n==================== خلاصه اجرا ====================")
     print(meta.to_string(index=False))
