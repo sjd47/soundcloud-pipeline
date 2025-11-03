@@ -255,6 +255,76 @@ def sc_hydrate_tracks(session, urns):
         print(f"    • batch hydrated: {min(i+len(batch), total)}/{total}")
     return out
 
+# ---- per-track metric validation + safe hydrate ----
+METRIC_KEYS = ("playback_count", "favoritings_count", "comment_count", "reposts_count")
+
+def track_metrics_any_missing(tr: dict) -> bool:
+    """
+    اگر حتی یکی از متریک‌های مهم None باشد → True
+    (صفر = داده معتبر. فقط None مشکل است، یا وقتی key وجود ندارد)
+    """
+    return any(tr.get(k) is None for k in METRIC_KEYS)
+
+def sc_hydrate_tracks_safe(session, urns, artist_urn: str = "", max_rounds: int = 3):
+    """
+    1) مثل sc_hydrate_tracks همه‌ی URNها را hydrate می‌کند
+    2) بعد چند دور تلاش می‌کند:
+       - ترک‌هایی که اصلاً نیامده‌اند را دوباره hydrate کند
+       - ترک‌هایی که هر متریک‌شان None است را دوباره بگیرد
+    """
+    if not urns:
+        return []
+
+    # دور اول: hydrate معمولی
+    tracks = sc_hydrate_tracks(session, urns)
+
+    # map بر اساس urn
+    by_urn: dict[str, dict] = {}
+    for t in tracks:
+        u = t.get("urn")
+        if u:
+            by_urn[u] = t
+
+    for round_idx in range(1, max_rounds + 1):
+        missing_urns = set(urns) - set(by_urn.keys())
+        bad_metric_urns = [u for u, t in by_urn.items() if track_metrics_any_missing(t)]
+        to_fix = list(missing_urns.union(bad_metric_urns))
+
+        if not to_fix:
+            # همه چیز اوکی شد
+            break
+
+        print(
+            f"    ↻ metrics retry round {round_idx}: "
+            f"{len(to_fix)} tracks نیاز به hydrate مجدد برای آرتیست {artist_urn}"
+        )
+
+        refreshed = sc_hydrate_tracks(session, to_fix)
+        for t in refreshed:
+            u = t.get("urn")
+            if u:
+                by_urn[u] = t
+
+    # گزارش اگر هنوز مشکل داریم (فقط روی لاگ)
+    remaining_missing = set(urns) - set(by_urn.keys())
+    remaining_bad = [u for u, t in by_urn.items() if track_metrics_any_missing(t)]
+
+    if remaining_missing:
+        print(
+            f"    ⚠️ بعد از retry هنوز {len(remaining_missing)} ترک hydrate نشده "
+            f"(artist {artist_urn})"
+        )
+    if remaining_bad:
+        print(
+            f"    ⚠️ بعد از retry هنوز {len(remaining_bad)} ترک متریک ناقص دارد "
+            f"(artist {artist_urn})"
+        )
+
+    # خروجی به همان ترتیب لیست urnها
+    return [by_urn[u] for u in urns if u in by_urn]
+
+
+
 def sc_user_albums_with_tracks(session, user_urn):
     items = sc_paged_get(session, f"{SC_API}/users/{user_urn}/playlists", {"limit":200, "show_tracks":True})
     def is_album(p): return (p.get("set_type") or p.get("playlist_type") or "").lower() == "album"
@@ -340,6 +410,18 @@ def main():
             username = user.get("username")
             followers = user.get("followers_count")
             track_count_total = user.get("track_count")
+
+            # اگر به هر دلیل track_count_total یا followers خالی بود → یک بار دیگر user را می‌گیریم
+            if track_count_total is None or followers is None:
+                try:
+                    user2 = sc_fetch_user(sess, artist_urn)
+                    username = user2.get("username", username)
+                    followers = user2.get("followers_count", followers)
+                    track_count_total = user2.get("track_count", track_count_total)
+                    print("    ℹ️ user refetched برای تکمیل track_count/followers")
+                except Exception as e:
+                    print(f"    ⚠️ نتونستیم user را دوباره بگیریم: {e}")
+
             print(f"    user: {username} | followers: {followers} | track_count_total: {track_count_total}")
 
             # --- tracks list ---
@@ -347,8 +429,15 @@ def main():
             urns = [t.get("urn") for t in tracks_list if t.get("urn")]
             print(f"    tracks fetched (list): {len(urns)}")
 
+            if track_count_total is not None and track_count_total != len(urns):
+                print(
+                    f"    ⚠️ هشدار: track_count_total={track_count_total} "
+                    f"اما tracks_list={len(urns)} (ممکن است به خاطر ترک‌های private یا حذف‌شده باشد)"
+                )
+
+            
             # --- hydrate tracks + albums ---
-            tracks_h = sc_hydrate_tracks(sess, urns)
+            tracks_h = sc_hydrate_tracks_safe(sess, urns, artist_urn)
             albums   = sc_user_albums_with_tracks(sess, artist_urn)
             album_map= build_album_map(albums)
 
@@ -413,26 +502,48 @@ def main():
             print(f"    ❌ Error در پاس اول ({artist_urn}): {e} → برای retry نگه می‌داریم")
             retry_candidates.append((artist_urn, input_name))
 
+    
     # ===== 4) پاس دوم (retry) فقط روی آرتیست‌های خطادار =====
     if retry_candidates:
         print(f"\n=== ✳️ شروع دور دوم برای {len(retry_candidates)} آرتیست خطادار ===")
         for r_idx, (artist_urn, input_name) in enumerate(retry_candidates, start=1):
             print(f"[retry {r_idx}/{len(retry_candidates)}] آرتیست: {artist_urn}  ({input_name or '-'})")
             try:
+                # --- user (با کنترل followers و track_count_total مثل پاس اول) ---
                 user = sc_fetch_user(sess, artist_urn)
                 username = user.get("username")
                 followers = user.get("followers_count")
                 track_count_total = user.get("track_count")
+
+                if track_count_total is None or followers is None:
+                    try:
+                        user2 = sc_fetch_user(sess, artist_urn)
+                        username = user2.get("username", username)
+                        followers = user2.get("followers_count", followers)
+                        track_count_total = user2.get("track_count", track_count_total)
+                        print("    [retry] ℹ️ user refetched برای تکمیل track_count/followers")
+                    except Exception as e:
+                        print(f"    [retry] ⚠️ نتونستیم user را دوباره بگیریم: {e}")
+
                 print(f"    [retry] user: {username} | followers: {followers} | track_count_total: {track_count_total}")
 
+                # --- tracks list ---
                 tracks_list = sc_user_tracks_list(sess, artist_urn)
                 urns = [t.get("urn") for t in tracks_list if t.get("urn")]
                 print(f"    [retry] tracks fetched (list): {len(urns)}")
 
-                tracks_h = sc_hydrate_tracks(sess, urns)
+                if track_count_total is not None and track_count_total != len(urns):
+                    print(
+                        f"    [retry] ⚠️ هشدار: track_count_total={track_count_total} "
+                        f"اما tracks_list={len(urns)} (ممکن است به خاطر ترک‌های private یا حذف‌شده باشد)"
+                    )
+
+                # --- hydrate tracks + albums (نسخه‌ی safe) ---
+                tracks_h = sc_hydrate_tracks_safe(sess, urns, artist_urn)
                 albums   = sc_user_albums_with_tracks(sess, artist_urn)
                 album_map= build_album_map(albums)
 
+                # --- جمع‌کردن خروجی‌ها ---
                 artist_rows.append({
                     "artist_urn": artist_urn,
                     "artist_input_name": input_name,
