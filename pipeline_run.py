@@ -201,15 +201,34 @@ def _sleep_backoff(attempt, retry_after=None):
     time.sleep(sec)
 
 def sc_get_with_retry(session, url, params=None, max_retries=4):
+    """
+    GET با retry هم برای status codeهای موقت (429/5xx)
+    هم برای خطاهای شبکه‌ای مثل Connection broken / IncompleteRead.
+    """
     attempt = 1
     while True:
-        resp = session.get(url, params=params, timeout=SC_TIMEOUT)
+        try:
+            resp = session.get(url, params=params, timeout=SC_TIMEOUT)
+        except (requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ConnectionError) as e:
+            # خطاهای شبکه‌ای (مثل همون IncompleteRead که دیدی)
+            if attempt < max_retries:
+                print(f"    ⚠️ network error on {url} (attempt {attempt}): {e} → retrying ...")
+                _sleep_backoff(attempt)
+                attempt += 1
+                continue
+            # بعد از چند تلاش هنوز خراب است → بده بره لایه‌ی بالاتر
+            raise
+
+        # اگر درخواست ارسال شده ولی status code موقتی بود (429/5xx)
         if resp.status_code in RETRY_STATUS and attempt < max_retries:
             _sleep_backoff(attempt, resp.headers.get("Retry-After"))
             attempt += 1
             continue
+
         resp.raise_for_status()
         return resp
+
 
 def sc_paged_get(session, url, params=None):
     params = dict(params or {})
@@ -288,39 +307,52 @@ def main():
     print("توکن OK ✅\n")
     sess = sc_session(token)
 
-    # artists input
+    # ===== 1) خواندن لیست آرتیست‌ها =====
     print("در حال خواندن لیست آرتیست‌ها ...")
     artists_df = load_artists_any()
     artists = artists_df["artist_urn"].tolist()
 
-    
     print("🔎 loaded rows from Drive:", len(artists_df))
     print(artists_df.head(3).to_string(index=False))
 
     n = len(artists)
     print(f"تعداد آرتیست‌ها: {n}\n")
 
-    track_rows, album_rows, artist_rows, error_rows = [], [], [], []
-    tracks_total = albums_total = ok_count = fail_count = 0
+    # ===== 2) متغیرهای تجمیعی =====
+    track_rows: list[dict] = []
+    album_rows: list[dict] = []
+    artist_rows: list[dict] = []
+    error_rows: list[dict] = []          # فقط خطاهای بعد از پاس دوم
 
-    for idx, artist_urn in enumerate(artists,  start=1):
+    tracks_total = 0
+    albums_total = 0
+    success_urns: set[str] = set()       # آرتیست‌هایی که در نهایت موفق شدند
+    retry_candidates: list[tuple[str, str | None]] = []  # (artist_urn, input_name)
+
+    # ===== 3) پاس اول روی همه‌ی آرتیست‌ها =====
+    for idx, artist_urn in enumerate(artists, start=1):
         input_name = artists_df.loc[idx-1, "artist_input_name"] if "artist_input_name" in artists_df.columns else None
         print(f"[{idx}/{n}] آرتیست: {artist_urn}  ({input_name or '-'})")
+
         try:
+            # --- user ---
             user = sc_fetch_user(sess, artist_urn)
             username = user.get("username")
             followers = user.get("followers_count")
             track_count_total = user.get("track_count")
             print(f"    user: {username} | followers: {followers} | track_count_total: {track_count_total}")
 
+            # --- tracks list ---
             tracks_list = sc_user_tracks_list(sess, artist_urn)
             urns = [t.get("urn") for t in tracks_list if t.get("urn")]
             print(f"    tracks fetched (list): {len(urns)}")
 
+            # --- hydrate tracks + albums ---
             tracks_h = sc_hydrate_tracks(sess, urns)
             albums   = sc_user_albums_with_tracks(sess, artist_urn)
             album_map= build_album_map(albums)
 
+            # --- artist summary row ---
             artist_rows.append({
                 "artist_urn": artist_urn,
                 "artist_input_name": input_name,
@@ -328,6 +360,8 @@ def main():
                 "followers": followers,
                 "track_count_total": track_count_total,
             })
+
+            # --- albums rows ---
             for alb in albums:
                 album_rows.append({
                     "artist_urn": artist_urn, "artist_username": username,
@@ -337,6 +371,8 @@ def main():
                     "album_cover_sig": extract_cover_sig(alb.get("artwork_url")),
                     "album_track_count": len(alb.get("tracks") or []),
                 })
+
+            # --- tracks rows ---
             for tr in tracks_h:
                 tr_urn = tr.get("urn")
                 row = {
@@ -362,29 +398,113 @@ def main():
 
             tracks_total += len(tracks_h)
             albums_total += len(albums)
-            ok_count += 1
+            success_urns.add(artist_urn)
 
         except requests.HTTPError as e:
             status = getattr(e.response, "status_code", None)
-            try: msg = e.response.json()
-            except: msg = str(e)
-            error_rows.append({
-                "timestamp": iran_now().isoformat(timespec="seconds"),
-                "artist_urn": artist_urn, "artist_input_name": input_name,
-                "step": "http", "http_status": status,
-                "message": json.dumps(msg, ensure_ascii=False) if isinstance(msg, dict) else str(msg),
-            })
-            print(f"    ❌ HTTPError {status} → ادامه می‌دیم")
-            fail_count += 1
-        except Exception as e:
-            error_rows.append({
-                "timestamp": iran_now().isoformat(timespec="seconds"),
-                "artist_urn": artist_urn, "artist_input_name": input_name,
-                "step":"exception","http_status":None,"message":str(e),
-            })
-            print(f"    ❌ Error: {e} → ادامه می‌دیم")
-            fail_count += 1
+            try:
+                msg = e.response.json()
+            except Exception:
+                msg = str(e)
+            print(f"    ❌ HTTPError {status} در پاس اول → برای retry نگه می‌داریم")
+            retry_candidates.append((artist_urn, input_name))
 
+        except Exception as e:
+            print(f"    ❌ Error در پاس اول ({artist_urn}): {e} → برای retry نگه می‌داریم")
+            retry_candidates.append((artist_urn, input_name))
+
+    # ===== 4) پاس دوم (retry) فقط روی آرتیست‌های خطادار =====
+    if retry_candidates:
+        print(f"\n=== ✳️ شروع دور دوم برای {len(retry_candidates)} آرتیست خطادار ===")
+        for r_idx, (artist_urn, input_name) in enumerate(retry_candidates, start=1):
+            print(f"[retry {r_idx}/{len(retry_candidates)}] آرتیست: {artist_urn}  ({input_name or '-'})")
+            try:
+                user = sc_fetch_user(sess, artist_urn)
+                username = user.get("username")
+                followers = user.get("followers_count")
+                track_count_total = user.get("track_count")
+                print(f"    [retry] user: {username} | followers: {followers} | track_count_total: {track_count_total}")
+
+                tracks_list = sc_user_tracks_list(sess, artist_urn)
+                urns = [t.get("urn") for t in tracks_list if t.get("urn")]
+                print(f"    [retry] tracks fetched (list): {len(urns)}")
+
+                tracks_h = sc_hydrate_tracks(sess, urns)
+                albums   = sc_user_albums_with_tracks(sess, artist_urn)
+                album_map= build_album_map(albums)
+
+                artist_rows.append({
+                    "artist_urn": artist_urn,
+                    "artist_input_name": input_name,
+                    "artist_username": username,
+                    "followers": followers,
+                    "track_count_total": track_count_total,
+                })
+                for alb in albums:
+                    album_rows.append({
+                        "artist_urn": artist_urn, "artist_username": username,
+                        "album_urn": alb.get("urn"), "album_title": alb.get("title"),
+                        "album_permalink_url": alb.get("permalink_url"),
+                        "album_artwork_url": alb.get("artwork_url"),
+                        "album_cover_sig": extract_cover_sig(alb.get("artwork_url")),
+                        "album_track_count": len(alb.get("tracks") or []),
+                    })
+                for tr in tracks_h:
+                    tr_urn = tr.get("urn")
+                    row = {
+                        "artist_urn": artist_urn, "artist_username": username,
+                        "followers": followers, "track_count_total": track_count_total,
+                        "track_urn": tr_urn, "track_title": tr.get("title"),
+                        "permalink_url": tr.get("permalink_url"),
+                        "artwork_url": tr.get("artwork_url"),
+                        "track_cover_sig": extract_cover_sig(tr.get("artwork_url")),
+                        "playback_count": tr.get("playback_count"),
+                        "likes_count": tr.get("favoritings_count"),
+                        "comment_count": tr.get("comment_count"),
+                        "reposts_count": tr.get("reposts_count"),
+                        "access": tr.get("access"), "streamable": tr.get("streamable"),
+                        "created_at": tr.get("created_at"),
+                        "release_date": compose_release_date(tr),
+                        "release_year": tr.get("release_year"),
+                        "release_month": tr.get("release_month"),
+                        "release_day": tr.get("release_day"),
+                    }
+                    row.update(flatten_album_fields(tr_urn, album_map))
+                    track_rows.append(row)
+
+                tracks_total += len(tracks_h)
+                albums_total += len(albums)
+                success_urns.add(artist_urn)
+                print("    ✅ retry موفق بود")
+
+            except requests.HTTPError as e:
+                status = getattr(e.response, "status_code", None)
+                try:
+                    msg = e.response.json()
+                except Exception:
+                    msg = str(e)
+                print(f"    ❌ HTTPError {status} در پاس دوم → این یکی واقعاً خطاست")
+                error_rows.append({
+                    "timestamp": iran_now().isoformat(timespec="seconds"),
+                    "artist_urn": artist_urn,
+                    "artist_input_name": input_name,
+                    "step": "retry_http",
+                    "http_status": status,
+                    "message": json.dumps(msg, ensure_ascii=False) if isinstance(msg, dict) else str(msg),
+                })
+
+            except Exception as e:
+                print(f"    ❌ Error در پاس دوم ({artist_urn}): {e}")
+                error_rows.append({
+                    "timestamp": iran_now().isoformat(timespec="seconds"),
+                    "artist_urn": artist_urn,
+                    "artist_input_name": input_name,
+                    "step": "retry_exception",
+                    "http_status": None,
+                    "message": str(e),
+                })
+
+    # ===== 5) ساخت DataFrameها =====
     df_tracks  = pd.DataFrame(track_rows)
     df_albums  = pd.DataFrame(album_rows)
     df_artists = pd.DataFrame(artist_rows)
@@ -393,14 +513,24 @@ def main():
     elapsed = time.time() - start
     snapshot_date = iran_now().strftime("%Y-%m-%d")
     timestamp     = iran_now().strftime("%Y-%m-%d %H:%M:%S")
+
+    ok_count     = len(success_urns)
+    fail_count   = n - ok_count
+    errors_total = int(len(df_errors))
+
     meta = pd.DataFrame([{
-        "snapshot_date": snapshot_date, "timestamp": timestamp,
-        "run_seconds": round(elapsed, 2), "artists_in": n,
-        "artists_ok": ok_count, "artists_failed": fail_count,
-        "tracks_total": int(tracks_total), "albums_total": int(albums_total),
-        "errors_total": int(len(df_errors)),
+        "snapshot_date": snapshot_date,
+        "timestamp": timestamp,
+        "run_seconds": round(elapsed, 2),
+        "artists_in": n,
+        "artists_ok": ok_count,
+        "artists_failed": fail_count,
+        "tracks_total": int(tracks_total),
+        "albums_total": int(albums_total),
+        "errors_total": errors_total,
     }])
 
+    # ===== 6) ذخیره اکسل =====
     os.makedirs(OUT_DIR, exist_ok=True)
     out_xlsx = os.path.join(OUT_DIR, f"soundcloud_batch_{ts_for_filename()}.xlsx")
     with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
@@ -408,21 +538,22 @@ def main():
         df_albums.to_excel(w, index=False, sheet_name="albums")
         df_artists.to_excel(w, index=False, sheet_name="artists")
         meta.to_excel(w, index=False, sheet_name="meta")
-        if len(df_errors): df_errors.to_excel(w, index=False, sheet_name="errors")
+        if len(df_errors):
+            df_errors.to_excel(w, index=False, sheet_name="errors")
 
     print("\n==================== خلاصه اجرا ====================")
     print(meta.to_string(index=False))
     print("out_file:", out_xlsx)
     print("====================================================\n")
 
-    # upload to Drive
+    # ===== 7) آپلود به درایو =====
     drive_link = None
     try:
         service = build_drive()
         file = drive_upload(service, out_xlsx, DRIVE_FOLDER_ID, share_anyone=True)
         drive_link = file.get("webViewLink")
         print("✅ Drive upload OK:", drive_link)
-        # write link back to meta sheet (optional)
+
         meta2 = meta.copy()
         meta2["drive_file_id"] = file.get("id")
         meta2["drive_webViewLink"] = drive_link
@@ -431,7 +562,7 @@ def main():
     except Exception as e:
         print("⚠️ Drive upload error:", e)
 
-    # Telegram summary (always)
+    # ===== 8) تلگرام =====
     try:
         coffee = "☕"
         msg = (
@@ -440,10 +571,11 @@ def main():
             f"تاریخ: {timestamp}\n"
             f"آرتیست‌های موفق: {ok_count}/{n}\n"
             f"تِرَک‌ها: {tracks_total} | آلبوم‌ها: {albums_total}\n"
-            f"خطاها: {len(df_errors)}\n"
+            f"خطاها: {errors_total}\n"
             f"زمان اجرا: {elapsed:.1f} ثانیه\n"
         )
-        if drive_link: msg += f"\nلینک درایو: {drive_link}"
+        if drive_link:
+            msg += f"\nلینک درایو: {drive_link}"
         tg_send_text(msg)
         tg_send_document(out_xlsx, caption=f"📎 فایل کامل ({timestamp})")
     except Exception as e:
